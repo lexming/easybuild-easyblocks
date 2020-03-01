@@ -37,7 +37,8 @@ from easybuild.easyblocks.generic.configuremake import ConfigureMake
 from easybuild.tools.build_log import EasyBuildError
 from easybuild.tools.modules import get_software_root
 from easybuild.tools.filetools import change_dir
-from easybuild.tools.run import run_cmd
+from easybuild.tools.run import run_cmd, check_log_for_errors
+from easybuild.tools.config import ERROR
 
 
 class EB_FreeFEM(ConfigureMake):
@@ -157,7 +158,10 @@ class EB_FreeFEM(ConfigureMake):
 
             env.setvar('OMP_NUM_THREADS', '%d' % n_thr)
 
-            run_cmd("make check", log_all=True, simple=False)
+            (out, _) = run_cmd("make check", log_all=True, simple=False, regexp=False)
+
+            # Raise an error if any test failed
+            check_log_for_errors(out, [('# (ERROR|FAIL): +[1-9]', ERROR)])
 
     def sanity_check_step(self):
         # define FreeFem++ sanity_check_paths here

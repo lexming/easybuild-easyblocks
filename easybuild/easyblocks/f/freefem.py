@@ -163,7 +163,7 @@ class EB_FreeFEM(ConfigureMake):
         # define FreeFem++ sanity_check_paths here
 
         custom_paths = {
-            'files': ['bin/%s' % x for x in ['bamg', 'cvmsh2', 'ffglut', 'ffmedit']] +
+            'files': ['bin/%s' % x for x in ['bamg', 'cvmsh2', 'ffglut', 'ffmaster', 'ffmedit']] +
                 ['bin/ff-%s' % x for x in ['c++', 'get-dep', 'mpirun', 'pkg-download']] +
                 ['bin/FreeFem++%s' % x for x in ['', '-mpi', '-nw']],
             'dirs': ['share/FreeFEM/%s' % self.version] +

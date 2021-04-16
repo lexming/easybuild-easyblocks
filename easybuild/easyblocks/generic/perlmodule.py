@@ -35,8 +35,9 @@ from easybuild.framework.easyconfig import CUSTOM
 from easybuild.framework.extensioneasyblock import ExtensionEasyBlock
 from easybuild.easyblocks.generic.configuremake import ConfigureMake
 from easybuild.tools.build_log import EasyBuildError
-from easybuild.tools.run import run_cmd
 from easybuild.tools.environment import unset_env_vars
+from easybuild.tools.py2vs3 import string_type
+from easybuild.tools.run import run_cmd
 
 
 class PerlModule(ExtensionEasyBlock, ConfigureMake):
@@ -98,14 +99,12 @@ class PerlModule(ExtensionEasyBlock, ConfigureMake):
     def run(self):
         """Perform the actual Perl module build/installation procedure"""
 
-        # Providing a name only is useful to make sure the module exists, e.g. as part of another module
         if not self.src:
-            if self.patches:
-                raise EasyBuildError("Cannot patch Perl module %s as no explicit source is given!", self.name)
-            self.log.debug("Skipping installation step of Perl module %s as no source was given." % self.name)
-        else:
-            ExtensionEasyBlock.run(self, unpack_src=True)
-            self.install_perl_module()
+            raise EasyBuildError("No source found for Perl module %s, required for installation. (src: %s)",
+                                 self.name, self.src)
+        ExtensionEasyBlock.run(self, unpack_src=True)
+
+        self.install_perl_module()
 
     def configure_step(self):
         """No separate configuration for Perl modules."""
@@ -127,7 +126,21 @@ class PerlModule(ExtensionEasyBlock, ConfigureMake):
         """
         Custom sanity check for Perl modules
         """
-        return ExtensionEasyBlock.sanity_check_step(self, EXTS_FILTER_PERL_MODULES, *args, **kwargs)
+        if 'modulename' not in self.options:
+            mod_names = [self.name]
+        elif isinstance(self.options['modulename'], string_type):
+            mod_names = [self.options['modulename']]
+        else:
+            mod_names = self.options['modulename']
+
+        for module in mod_names:
+            self.options['modulename'] = module
+            ec, err = ExtensionEasyBlock.sanity_check_step(self, EXTS_FILTER_PERL_MODULES, *args, **kwargs)
+
+            if ec is not True:
+                return (ec, err)
+
+        return (True, '')
 
     def make_module_req_guess(self):
         """Customized dictionary of paths to look for with PERL*LIB."""

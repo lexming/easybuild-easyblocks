@@ -43,6 +43,7 @@ from easybuild.tools.build_log import EasyBuildError
 from easybuild.tools.filetools import adjust_permissions, change_dir, mkdir, remove_file, symlink, write_file
 from easybuild.tools.modules import get_software_libdir, get_software_root, get_software_version
 from easybuild.tools.run import run_cmd
+from easybuild.tools.toolchain.mpi import get_mpi_cmd_template
 
 
 class EB_NWChem(ConfigureMake):
@@ -488,6 +489,7 @@ class EB_NWChem(ConfigureMake):
                 # run tests
                 for testx in tests:
                     cmd = "nwchem %s" % testx
+                    cmd = self.toolchain.mpi_cmd_for(cmd, self.cfg['parallel'])
                     msg = "Running test '%s' (from %s) in %s..." % (cmd, testdir, tmpdir)
                     self.log.info(msg)
                     test_cases_log.write("\n%s\n" % msg)

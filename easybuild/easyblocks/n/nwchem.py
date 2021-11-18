@@ -430,8 +430,6 @@ class EB_NWChem(ConfigureMake):
                 ('dirdyvtst/oh3', ['oh3tr3.nw']),
                 ('dirdyvtst/oh3', ['oh3tr4.nw']),
                 ('dirdyvtst/oh3', ['oh3tr5.nw']),
-                ('pspw/session1', ['band.nw', 'si4.linear.nw', 'si4.rhombus.nw', 'S2-drift.nw',
-                                   'silicon.nw', 'S2.nw', 'si4.rectangle.nw']),
                 ('md/myo', ['myo.nw']),
                 ('md/nak', ['NaK.nw']),
                 ('md/crown', ['crown.nw']),

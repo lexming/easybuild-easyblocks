@@ -1,5 +1,5 @@
 ##
-# Copyright 2009-2023 Ghent University
+# Copyright 2009-2021 Ghent University
 #
 # This file is part of EasyBuild,
 # originally created by the HPC team of Ghent University (http://ugent.be/hpc/en),
@@ -64,7 +64,8 @@ class EB_GAMESS_minus_US(EasyBlock):
         extra_vars = {
             'ddi_comm': ['mpi', "DDI communication layer to use", CUSTOM],
             'runtest': [True, "Run GAMESS-US tests", CUSTOM],
-            'scratch_dir': ['$TMPDIR', "Scratch dir to be used in rungms script", CUSTOM],
+            'scratch_dir': ['$TMPDIR', "dir for temporary binary files", CUSTOM],
+            'user_scratch_dir': ['$TMPDIR', "dir for supplementary output files", CUSTOM],
         }
         return EasyBlock.extra_options(extra_vars)
 
@@ -248,10 +249,10 @@ class EB_GAMESS_minus_US(EasyBlock):
                 line = re.sub(r"^(\s*set GA_MPI_ROOT)=.*%s.*" % mpilib.lower(), r"\1=%s" % mpilib_path, line)
                 # comment out all adjustments to $LD_LIBRARY_PATH that involves hardcoded paths
                 line = re.sub(r"^(\s*)(setenv\s*LD_LIBRARY_PATH\s*/.*)", r"\1#\2", line)
-                if self.cfg['scratch_dir']:
-                    line = re.sub(r"^(\s*set\s*SCR)=.*", r"\1=%s" % self.cfg['scratch_dir'], line)
-                    line = re.sub(r"^(\s*set\s*USERSCR)=.*", r"\1=%s" % self.cfg['scratch_dir'], line)
-                    line = re.sub(r"^(df -k \$SCR)$", r"mkdir -p $SCR && \1", line)
+                # inject scratch dir paths
+                line = re.sub(r"^(\s*set\s*SCR)=.*", r"if ( ! $?SCR ) \1=%s" % self.cfg['scratch_dir'], line)
+                line = re.sub(r"^(\s*set\s*USERSCR)=.*", r"if ( ! $?USERSCR ) \1=%s" % self.cfg['user_scratch_dir'], line)
+                line = re.sub(r"^(df -k \$SCR)$", r"mkdir -p $SCR && mkdir -p $USERSCR && \1", line)
                 sys.stdout.write(line)
         except IOError as err:
             raise EasyBuildError("Failed to patch %s: %s", rungms, err)
@@ -301,9 +302,10 @@ class EB_GAMESS_minus_US(EasyBlock):
         ]
         apply_regex_substitutions(lked_exe, regex_subs)
 
-        if LooseVersion(self.version) >= LooseVersion('2021'):
+        if LooseVersion(self.version) == "20210930-R2-p1":
             # build mod_vb2000: gamess.F needs it regardless of the optional VB2000 plug-in
             # this is probably a bug in the 'compall' build script
+            # fixed in 20210930-R2-p2
             comp_cmd = os.path.join(self.cfg['start_dir'], 'comp')
             comp_vb2000 = "%s %s %s %s" % (self.cfg['prebuildopts'], comp_cmd, 'mod_vb2000', self.cfg['buildopts'])
             run_cmd(comp_vb2000, log_all=True, simple=True)
@@ -325,7 +327,8 @@ class EB_GAMESS_minus_US(EasyBlock):
                 return
 
             if int(self.cfg['parallel']) < 2:
-                raise EasyBuildError("MPI tests need at least 2 CPU cores to run")
+                self.log.info("Skipping testing of GAMESS-US as MPI tests need at least 2 CPU cores to run")
+                return
 
             try:
                 cwd = os.getcwd()

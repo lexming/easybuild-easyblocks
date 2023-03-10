@@ -1,5 +1,5 @@
 ##
-# Copyright 2009-2021 Ghent University
+# Copyright 2009-2020 Ghent University
 #
 # This file is part of EasyBuild,
 # originally created by the HPC team of Ghent University (http://ugent.be/hpc/en),
@@ -37,10 +37,12 @@ EasyBuild support for building and installing GAMESS-US, implemented as an easyb
 import fileinput
 import glob
 import os
+import random
 import re
 import shutil
 import sys
 import tempfile
+import fnmatch
 
 from distutils.version import LooseVersion
 
@@ -48,8 +50,9 @@ from easybuild.framework.easyblock import EasyBlock
 from easybuild.framework.easyconfig import CUSTOM, MANDATORY
 from easybuild.tools.build_log import EasyBuildError
 from easybuild.tools.config import build_option
-from easybuild.tools.filetools import apply_regex_substitutions, read_file, write_file
+from easybuild.tools.filetools import change_dir, read_file, write_file
 from easybuild.tools.modules import get_software_root, get_software_version
+from easybuild.tools.py2vs3 import ascii_letters
 from easybuild.tools.run import run_cmd, run_cmd_qa
 from easybuild.tools.systemtools import get_platform_name
 from easybuild.tools import toolchain
@@ -63,6 +66,8 @@ class EB_GAMESS_minus_US(EasyBlock):
         """Define custom easyconfig parameters for GAMESS-US."""
         extra_vars = {
             'ddi_comm': ['mpi', "DDI communication layer to use", CUSTOM],
+            'maxcpus': [None, "Maximum number of cores per node", MANDATORY],
+            'maxnodes': [None, "Maximum number of nodes", MANDATORY],
             'runtest': [True, "Run GAMESS-US tests", CUSTOM],
             'scratch_dir': ['$TMPDIR', "dir for temporary binary files", CUSTOM],
             'user_scratch_dir': ['$TMPDIR', "dir for supplementary output files", CUSTOM],
@@ -89,12 +94,17 @@ class EB_GAMESS_minus_US(EasyBlock):
 
     def configure_step(self):
         """Configure GAMESS-US build via provided interactive 'config' script."""
-
+        """Opening install.info file as append"""
+        f = open(self.builddir + "/install.info", "a")
+        f.writelines(["setenv GMS_PATH " + self.builddir + "\n"
+            "setenv GMS_BUILD_DIR " + self.installdir + "\n"])
         # machine type
         platform_name = get_platform_name()
         x86_64_linux_re = re.compile('^x86_64-.*$')
         if x86_64_linux_re.match(platform_name):
             machinetype = "linux64"
+            f.writelines(["setenv GMS_TARGET " + machinetype + "\n" +
+                "setenv GMS_HPC_SYSTEM_TARGET generic" + "\n"])
         else:
             raise EasyBuildError("Build target %s currently unsupported", platform_name)
 
@@ -115,26 +125,34 @@ class EB_GAMESS_minus_US(EasyBlock):
         else:
             raise EasyBuildError("Compiler family '%s' currently unsupported.", comp_fam)
 
+        f.writelines(["setenv GMS_FORTRAN " + fortran_comp + "\n" + 
+            "setenv GMS_GFORTRAN_VERNO " + fortran_ver + "\n"])
+
         # math library config
         known_mathlibs = ['imkl', 'OpenBLAS', 'ATLAS', 'ACML']
-        loaded_mathlib = filter(get_software_root, known_mathlibs)
-
-        if len(loaded_mathlib) == 0:
-            raise EasyBuildError("None of the known math libraries (%s) available, giving up.", known_mathlibs)
-        elif len(loaded_mathlib) > 1:
-            raise EasyBuildError("Multiple math libraries loaded (%s), giving up.", loaded_mathlib)
+        loaded_mathlib = [mathlib for mathlib in known_mathlibs if get_software_root(mathlib)]
 
         # math library: default settings
-        mathlib = loaded_mathlib[0].lower()
-        mathlib_root = get_software_root(loaded_mathlib[0])
-        mathlib_subfolder = ''
+        try:
+            mathlib = loaded_mathlib[0].lower()
+            mathlib_root = get_software_root(loaded_mathlib[0])
+            mathlib_subfolder = ''
+            mathlib_flags = ''
+        except KeyError:
+            raise EasyBuildError("None of the known math libraries (%s) available, giving up.", known_mathlibs)
 
-        # math library: special cases
         if mathlib == 'imkl':
             mathlib = 'mkl'
             mathlib_subfolder = 'mkl'
+            mathlib_flags = '-lmkl_intel_lp64'
+            imkl_ver = get_software_version('imkl')
+            if LooseVersion(imkl_ver) >= LooseVersion("2021"):
+                mathlib_subfolder = 'mkl/latest/lib/intel64'
+            elif LooseVersion(imkl_ver) >= LooseVersion("2020"):
+                mathlib_subfolder = 'mkl/lib/intel64'
         elif mathlib == 'openblas':
-            if LooseVersion(self.version) >= LooseVersion('2021'):
+            mathlib_flags="-lopenblas -lgfortran"
+            if LooseVersion(self.version) >= LooseVersion('20210101'):
                 mathlib_subfolder = 'lib'
 
         if mathlib_root is not None:
@@ -143,11 +161,18 @@ class EB_GAMESS_minus_US(EasyBlock):
         else:
             raise EasyBuildError("Software root of math libraries (%s) not found", mathlib)
 
+        f.writelines([
+            "setenv GMS_MATHLIB " + mathlib + "\n" + 
+            "setenv GMS_MATHLIB_PATH " + mathlib_path + "\n" +
+            "setenv GMS_LAPACK_LINK_LINE " + '"%s"' % mathlib_flags + "\n"])
+
         # verify selected DDI communication layer
-        known_ddi_comms = ['mpi', 'mixed', 'serial', 'shmem', 'sockets']
+        known_ddi_comms = ['mpi', 'mixed', 'shmem', 'sockets']
         if not self.cfg['ddi_comm'] in known_ddi_comms:
             raise EasyBuildError("Unsupported DDI communication layer specified (known: %s): %s",
                                  known_ddi_comms, self.cfg['ddi_comm'])
+        
+        f.writelines(["setenv GMS_DDI_COMM " + self.cfg['ddi_comm'] + "\n"])
 
         # MPI library config
         mpilib, mpilib_root, mpilib_path = None, None, None
@@ -168,71 +193,65 @@ class EB_GAMESS_minus_US(EasyBlock):
         else:
             mpilib, mpilib_root = '', ''
 
+        f.writelines(["setenv GMS_MPI_LIB " + mpilib + "\n" + 
+            "setenv GMS_MPI_PATH " + mpilib_root + "\n"])
+
         # OpenMP config
-        omp_config = 'no'
         if self.toolchain.options.get('openmp', None):
-            omp_config = 'yes'
+            f. writelines(["setenv GMS_OPENMP true" + "\n"])
+        else:
+            f. writelines(["setenv GMS_OPENMP false" + "\n"])
 
-        # Optional settings
-        optional = ['cct3', 'libcchem', 'libxc', 'mdi', 'neo', 'nbo', 'tinker', 'vb2000', 'vm2', 'xmvb']
-        optional = dict.fromkeys(optional, 'no')
+        # These are extra programs which for now we simply set all to FALSE
+        f. writelines(["setenv GMS_MSUCC false " + "\n"])
+        f. writelines(["setenv GMS_LIBCCHEM false" + "\n"])
+        f. writelines(["setenv GMS_PHI none " + "\n"])
+        f. writelines(["setenv GMS_SHMTYPE sysv " + "\n"])
 
-        if LooseVersion(self.version) >= LooseVersion('2021'):
-            # libxc
+        # Optional plug-ins and interfaces
+        # libXC
+        plugs_opt = dict()
+        if LooseVersion(self.version) >= LooseVersion('20210101'):
+            plugs_opt['GMS_LIBXC'] = "false"
             if get_software_root('libxc'):
-                optional['libxc'] = 'yes'
-            # MDI
-            # needs https://github.com/MolSSI-MDI/MDI_Library
-            # NBO
-            if get_software_root('NBO'):
-                optional['nbo'] = 'yes'
-            # TINKER
-            if get_software_root('TINKER'):
-                optional['tinker'] = 'yes'
+                plugs_opt['GMS_LIBXC'] = "true"
+                # the linker needs to be patched to use external libXC
+                lixc_libs = [os.path.join(os.environ['EBROOTLIBXC'], 'lib', l) for l in ['libxcf03.a', 'libxc.a']]
+                libxc_linker_flags = ' '.join(lixc_libs)
+                try:
+                    lked = os.path.join(self.builddir, 'lked')
+                    for line in fileinput.input(lked, inplace=1, backup='.orig'):
+                        line = re.sub(r"^(\s*set\sLIBXC_FLAGS)=.*GMS_PATH.*", r'\1="%s"' % libxc_linker_flags, line)
+                        sys.stdout.write(line)
+                except IOError as err:
+                    raise EasyBuildError("Failed to patch %s: %s", lked, err)
+        # MDI
+        # needs https://github.com/MolSSI-MDI/MDI_Library
+        plugs_opt['GMS_MDI'] = "false"
+        # VM2
+        plugs_opt['GMS_VM2'] = "false"
+        # NBO
+        plugs_opt['NBO'] = "false"
+        if get_software_root('NBO'):
+            plugs_opt['NBO'] = "true"
+        # NEO
+        plugs_opt['NEO'] = "false"
+        # TINKER
+        plugs_opt['TINKER'] = "false"
+        if get_software_root('TINKER'):
+            plugs_opt['TINKER'] = "true"
+        # VB2000
+        plugs_opt['VB2000'] = "false"
+        # XMVB
+        plugs_opt['XMVB'] = "false"
+        for opt in plugs_opt.items():
+            f. writelines(["setenv %s %s \n" % opt])
 
-        # run interactive 'config' script to generate install.info file
-        cmd = "%(preconfigopts)s ./config %(configopts)s" % {
-            'preconfigopts': self.cfg['preconfigopts'],
-            'configopts': self.cfg['configopts'],
-        }
-        qa = {
-            "please enter your target machine name: ": machinetype,
-            "Version? [00] ": self.version,
-            "Please enter your choice of FORTRAN: ": fortran_comp,
-            "MKL pathname? ": mathlib_root,
-            "MKL version (or 'skip')? ": 'skip',
-            "MKL version (or 'proceed')? ": 'proceed',  # changed in gamess-20170420R1
-            "please hit <return> to compile the GAMESS source code activator": '',
-            "Please enter your %s's location: " % mpilib: mpilib_root,
-            "Do you want to try LIBCCHEM?  (yes/no): ": optional['libcchem'],
-            "Enter full path to OpenBLAS libraries (without 'lib' subdirectory):": mathlib_path,
-            "Build GAMESS with OpenMP thread support?  (yes/no):": omp_config,
-            "Optional: Build Michigan State University CCT3 & CCSD3A methods?  (yes/no): ": optional['cct3'],
-            "Optional: Build LibXC interface?  (yes/no): ": optional['libxc'],
-            "Optional: Build MDI support?  (yes/no): ": optional['mdi'],
-            "Optional: Build GAMESS with TINKER plug-in? (yes/no): ": optional['tinker'],
-            "Optional: Build GAMESS with VeraChem's VM2 library? (yes/no): ": optional['vm2'],
-            "Optional: Build GAMESS with VB2000 plug-in? (yes/no): ": optional['vb2000'],
-            "Optional: Build GAMESS with XMVB plug-in? (yes/no): ": optional['xmvb'],
-            "Optional: Build GAMESS with NEO plug-in? (yes/no): ": optional['neo'],
-            "Optional: Build GAMESS with NBO plug-in? (yes/no): ": optional['nbo'],
-            "Hit <ENTER>.": '', # used after informational messages
-        }
-        stdqa = {
-            r"After the new window is open, please hit <(return|ENTER)> to go on.": '',
-            r"[hH]it <(return|ENTER)> to continue to the math library setup.": '',
-            r".*[hH]it <(return|ENTER)> to set up your network for Linux clusters.": '',
-            r"GAMESS directory\? \[.*\] ": self.builddir,
-            r"GAMESS build directory\? \[.*\] ": self.installdir,  # building in install directory
-            r"Enter only the main version number, such as .*\nVersion\? ": fortran_ver,
-            r".+gfortran version.\n( \n)?Please enter only the first decimal place, such as .*:": fortran_ver,
-            r"Enter your choice of 'mkl' or .* 'none': ": mathlib,
-            r"Enter your math library choice from one of the options below:\n([ ',a-z]+\n)+: ": mathlib,
-            r"Where is your libopenblas64.a or libopenblas.a file located\?\n( \n)?.+full pathname: ": mathlib_path,
-            r"communication library \([ ',a-z]+\)\?( )?": self.cfg['ddi_comm'],
-            r"Enter MPI library \([ ,a-z0-9]+\):( )?": mpilib,
-        }
-        run_cmd_qa(cmd, qa=qa, std_qa=stdqa, log_all=True, simple=True)
+        # add include paths from dependencies
+        f. writelines(['setenv GMS_FPE_FLAGS "%s" \n' % os.environ['CPPFLAGS']]) 
+        #f. writelines(["setenv GMS_FPE_FLAGS '-ffpe-trap=invalid,zero,overflow' " + "\n"]) # This seems to be useful for debugging 
+
+        f.close()
 
         self.log.debug("Contents of install.info:\n%s" % read_file(os.path.join(self.builddir, 'install.info')))
 
@@ -249,13 +268,36 @@ class EB_GAMESS_minus_US(EasyBlock):
                 line = re.sub(r"^(\s*set GA_MPI_ROOT)=.*%s.*" % mpilib.lower(), r"\1=%s" % mpilib_path, line)
                 # comment out all adjustments to $LD_LIBRARY_PATH that involves hardcoded paths
                 line = re.sub(r"^(\s*)(setenv\s*LD_LIBRARY_PATH\s*/.*)", r"\1#\2", line)
-                # inject scratch dir paths
+                # scratch directory paths
                 line = re.sub(r"^(\s*set\s*SCR)=.*", r"if ( ! $?SCR ) \1=%s" % self.cfg['scratch_dir'], line)
                 line = re.sub(r"^(\s*set\s*USERSCR)=.*", r"if ( ! $?USERSCR ) \1=%s" % self.cfg['user_scratch_dir'], line)
                 line = re.sub(r"^(df -k \$SCR)$", r"mkdir -p $SCR && mkdir -p $USERSCR && \1", line)
                 sys.stdout.write(line)
         except IOError as err:
             raise EasyBuildError("Failed to patch %s: %s", rungms, err)
+
+        # Replacing the MAXCPUS and MAXNODES in compddi to a value from the EasyConfig file
+        compddi = os.path.join(self.builddir, 'ddi/compddi')
+        try:
+            for line in fileinput.input(compddi, inplace=1, backup='.orig'):
+                line = re.sub(r"^(\s*set MAXCPUS)=.*", r"\1=%s" % self.cfg['maxcpus'], line, 1)
+                line = re.sub(r"^(\s*set MAXNODES)=.*", r"\1=%s" % self.cfg['maxnodes'], line, 1)
+                sys.stdout.write(line)
+        except IOError as err:
+                raise EasyBuildError("Failed to patch compddi", compddi, err)
+
+        # for GAMESS-US 20200630-R1 we need to build the actvte.x program
+        if self.version == "20200630-R1":
+            actvte = os.path.join(self.builddir, 'tools/actvte.code')
+            try:
+                for line in fileinput.input(actvte, inplace=1, backup='.orig'):
+                    line = re.sub("\*UNX", "    ", line)
+                    sys.stdout.write(line)
+            except IOError as err:
+                raise EasyBuildError("Failed to patch actvte.code", actvte, err)
+            # compiling
+            run_cmd("mv %s/tools/actvte.code" % self.builddir + " %s/tools/actvte.f" % self.builddir)
+            run_cmd("%s -o " % fortran_comp + " %s/tools/actvte.x" % self.builddir + " %s/tools/actvte.f" % self.builddir)
 
     def build_step(self):
         """Custom build procedure for GAMESS-US: using compddi, compall and lked scripts."""
@@ -279,37 +321,6 @@ class EB_GAMESS_minus_US(EasyBlock):
                 self.log.info("Moving ddikick.x executable from %s to %s." % (src, dst))
                 os.rename(src, dst)
 
-        # add include paths from dependencies in EasyBuild
-        regex_subs = [
-            (r'set EXTRAOPT="\s*"$', 'set EXTRAOPT="%s"' % os.getenv('CPPFLAGS')),
-        ]
-        comp_exe = os.path.join(self.cfg['start_dir'], 'comp')
-        apply_regex_substitutions(comp_exe, regex_subs)
-
-        # add linker paths from dependencies in EasyBuild
-        ldflags = os.getenv('LDFLAGS')
-
-        if get_software_root('libxc'):
-            ldflags += " -lxcf03 -lxc"
-
-        # OpenBLAS in EasyBuild links to OpenMP
-        ldflags += " -fopenmp"
-
-        lked_exe = os.path.join(self.cfg['start_dir'], 'lked')
-        regex_subs = [
-            (r'\$LIBXC_FLAGS \\$', ldflags),
-            (r'\$MDI_FLAGS$', ''),
-        ]
-        apply_regex_substitutions(lked_exe, regex_subs)
-
-        if LooseVersion(self.version) == "20210930-R2-p1":
-            # build mod_vb2000: gamess.F needs it regardless of the optional VB2000 plug-in
-            # this is probably a bug in the 'compall' build script
-            # fixed in 20210930-R2-p2
-            comp_cmd = os.path.join(self.cfg['start_dir'], 'comp')
-            comp_vb2000 = "%s %s %s %s" % (self.cfg['prebuildopts'], comp_cmd, 'mod_vb2000', self.cfg['buildopts'])
-            run_cmd(comp_vb2000, log_all=True, simple=True)
-
         compall_cmd = os.path.join(self.cfg['start_dir'], 'compall')
         compall = "%s %s %s" % (self.cfg['prebuildopts'], compall_cmd, self.cfg['buildopts'])
         run_cmd(compall, log_all=True, simple=True)
@@ -326,15 +337,7 @@ class EB_GAMESS_minus_US(EasyBlock):
                 self.log.info("Skipping testing of GAMESS-US since MPI testing is disabled")
                 return
 
-            if int(self.cfg['parallel']) < 2:
-                self.log.info("Skipping testing of GAMESS-US as MPI tests need at least 2 CPU cores to run")
-                return
-
-            try:
-                cwd = os.getcwd()
-                os.chdir(self.testdir)
-            except OSError as err:
-                raise EasyBuildError("Failed to move to temporary directory for running tests: %s", err)
+            cwd = change_dir(self.testdir)
 
             # copy input files for exam<id> standard tests
             for test_input in glob.glob(os.path.join(self.installdir, 'tests', 'standard', 'exam*.inp')):
@@ -344,7 +347,7 @@ class EB_GAMESS_minus_US(EasyBlock):
                     raise EasyBuildError("Failed to copy %s to %s: %s", test_input, os.getcwd(), err)
 
             rungms = os.path.join(self.installdir, 'rungms')
-            test_env_vars = ['TMPDIR=%s' % self.testdir]
+            test_env_vars = ['export OMP_NUM_THREADS=1; TMPDIR=%s' % self.testdir]
             if self.toolchain.mpi_family() == toolchain.INTELMPI:
                 test_env_vars.extend([
                     'I_MPI_FALLBACK=enable',  # enable fallback in case first fabric fails (see $I_MPI_FABRICS_LIST)
@@ -352,12 +355,10 @@ class EB_GAMESS_minus_US(EasyBlock):
                 ])
 
             # run all exam<id> tests, dump output to exam<id>.log
-            if LooseVersion(self.version) >= LooseVersion('2021'):
-                n_tests = 48
-            else:
-                n_tests = 47
-
-            for i in range(1, n_tests + 1):
+            # we let Python count the number of *.inp files as that changes
+            tests_path = os.path.join(self.installdir, 'tests', 'standard')
+            n_tests = len(fnmatch.filter(os.listdir(tests_path), '*.inp'))
+            for i in range(1, n_tests+1):
                 test_cmd = ' '.join(test_env_vars + [rungms, 'exam%02d' % i, self.version, '1', '2'])
                 (out, _) = run_cmd(test_cmd, log_all=True, simple=False)
                 write_file('exam%02d.log' % i, out)
@@ -371,12 +372,7 @@ class EB_GAMESS_minus_US(EasyBlock):
             else:
                 raise EasyBuildError("Not all tests ran successfully...")
 
-            # cleanup
-            os.chdir(cwd)
-            try:
-                shutil.rmtree(self.testdir)
-            except OSError as err:
-                raise EasyBuildError("Failed to remove test directory %s: %s", self.testdir, err)
+            change_dir(cwd)
 
     def install_step(self):
         """Skip install step, since we're building in the install directory."""
@@ -396,3 +392,11 @@ class EB_GAMESS_minus_US(EasyBlock):
         txt += self.module_generator.set_environment('GAMESSUSROOT', self.installdir)
         txt += self.module_generator.prepend_paths("PATH", [''])
         return txt
+
+    def cleanup_step(self):
+        """Cleanup set."""
+        # remove dedicated scratch directory (if any);
+        # we must use a shell command for this, since the path may contain environment variables
+        super(EB_GAMESS_minus_US, self).cleanup_step()
+
+        # FIXME
